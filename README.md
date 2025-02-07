@@ -6,3 +6,4 @@ i have no knowledge with coding i just made it with AI
 this script using :
 ffmepg : https://www.ffmpeg.org/
 fast-whisper https://github.com/Purfview/whisper-standalone-win
+
