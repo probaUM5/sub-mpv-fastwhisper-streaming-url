@@ -1,5 +1,4 @@
 
-
 -- Add the sanitize function
 local function sanitize_filename(filename)
     return filename:gsub("[<>:\"/\\|?*]", "_")
