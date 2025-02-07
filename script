@@ -1,0 +1,630 @@
+
+
+-- Add the sanitize function
+local function sanitize_filename(filename)
+    return filename:gsub("[<>:\"/\\|?*]", "_")
+end
+
+local msg = require 'mp.msg'
+local utils = require 'mp.utils'
+local options = require "mp.options"
+
+---- Script Options ----
+local o = {
+    -- Path to the faster-whisper executable; download it from:
+    -- https://github.com/Purfview/whisper-standalone-win
+    fast_whisper_path = "C:/Users/user/Downloads/Faster-Whisper-XXL_r245.1_windows/Faster-Whisper-XXL/faster-whisper-xxl.exe",
+    -- Model to use; available models: base, small, medium, large, large-v2, large-v3, turbo
+    model = "base",
+    -- Device to use: "cpu" or "cuda"
+    device = "cuda",
+    -- Language of transcription (leave empty for auto-detect)
+    language = "",
+    -- Number of CPU threads to use (0 = auto-detect, max 4)
+    threads = "0",
+    -- Maximum number of characters per line before breaking the line
+    max_line_width = "100",
+    -- Output path for both the MP3 and subtitle file.
+    -- Set this to your desired folder.
+    output_path = "C:/Users/user/Documents/MPV/tracks",
+    -- Number of subtitles generated before updating (to reduce flicker)
+    update_interval = 5,
+    -- Use segmentation for transcription (depends on FFmpeg)
+    use_segment = false,
+    -- Segment duration in seconds
+    segment_duration = 10,
+    ---- GPT API Options (for translation; not used if api_key is empty)
+    api_url = "",
+    api_key = "",
+    api_mode = "gpt-4o",
+    api_temperature = 0.7,
+    api_rate = 15,
+    -- Translation target language
+    translate = "Chinese",
+    -- Font used for generated ASS captions (if translation is used)
+    font_name = "sans-serif",
+}
+
+options.read_options(o, "sub-fastwhisper")
+
+------------------------
+local fast_whisper_path = mp.command_native({ "expand-path", o.fast_whisper_path })
+local output_path = mp.command_native({ "expand-path", o.output_path })
+
+local subtitle_count = 1
+local append_subtitle_count = 1
+local subtitles_written = false
+local whisper_running = false
+
+local is_windows = package.config:sub(1, 1) == "\\"
+
+local function is_protocol(path)
+    return type(path) == 'string' and (path:find('^%a[%w.+-]-://') ~= nil or path:find('^%a[%w.+-]-:%?') ~= nil)
+end
+
+local function file_exists(path)
+    if path then
+        local meta = utils.file_info(path)
+        return meta and meta.is_file
+    end
+    return false
+end
+
+local function check_and_remove_empty_file(file_path)
+    if file_exists(file_path) then
+        local file = io.open(file_path, "r")
+        if file then
+            local content = file:read("*all")
+            file:close()
+            if content == "" then
+                os.remove(file_path)
+            end
+        end
+    end
+end
+
+local function normalize(path)
+    if normalize_path ~= nil then
+        if normalize_path then
+            path = mp.command_native({"normalize-path", path})
+        else
+            local directory = mp.get_property("working-directory", "")
+            path = utils.join_path(directory, path:gsub('^%.[\\/]',''))
+            if is_windows then path = path:gsub("\\", "/") end
+        end
+        return path
+    end
+
+    normalize_path = false
+    local commands = mp.get_property_native("command-list", {})
+    for _, command in ipairs(commands) do
+        if command.name == "normalize-path" then
+            normalize_path = true
+            break
+        end
+    end
+    return normalize(path)
+end
+
+local function is_text_identical(text1, text2)
+    local function normalize_text(text)
+        text = text:gsub("，", ",")
+                  :gsub("。", ".")
+                  :gsub("！", "!")
+                  :gsub("？", "?")
+                  :gsub("；", ";")
+                  :gsub("：", ":")
+                  :gsub("“", "\"")
+                  :gsub("”", "\"")
+                  :gsub("‘", "'")
+                  :gsub("’", "'")
+                  :gsub("（", "(")
+                  :gsub("）", ")")
+                  :gsub("【", "[")
+                  :gsub("】", "]")
+                  :gsub("《", "<")
+                  :gsub("》", ">")
+                  :gsub("、", "/")
+                  :gsub("～", "~")
+        text = text:gsub("[%p%s]", "")
+        return text:lower()
+    end
+    return normalize_text(text1) == normalize_text(text2)
+end
+
+local function format_time(time_str)
+    local h, m, s, ms = nil, nil, nil, nil
+    if time_str:match("%d+:%d+:%d+%.%d+") then
+        h, m, s, ms = time_str:match("(%d+):(%d+):(%d+)%.(%d+)")
+    else
+        m, s, ms = time_str:match("(%d+):(%d+)%.(%d+)")
+    end
+    if not h then h = 0 end
+    return string.format("%02d:%02d:%02d,%03d", h, m, s, ms)
+end
+
+local function timestamp_to_seconds(timestamp)
+    local h, m, s, ms = timestamp:match("(%d+):(%d+):(%d+),(%d+)")
+    return tonumber(h) * 3600 + tonumber(m) * 60 + tonumber(s) + tonumber(ms) / 1000
+end
+
+local function seconds_to_timestamp(seconds)
+    local h = math.floor(seconds / 3600)
+    local m = math.floor(seconds / 60) % 60
+    local s = math.floor(seconds % 60)
+    local ms = math.floor((seconds - math.floor(seconds)) * 1000)
+    return string.format("%02d:%02d:%02d,%03d", h, m, s, ms)
+end
+
+local function get_current_sub()
+    local sub = mp.get_property_native("current-tracks/sub")
+    if sub then
+        if sub.external and not is_protocol(sub["external-filename"]) and sub["external-filename"]:lower():match("%.srt$") then
+            return sub["external-filename"]
+        end
+    end
+    return nil
+end
+
+local function check_sub(sub_file)
+    local tracks = mp.get_property_native("track-list")
+    local _, sub_title = utils.split_path(sub_file)
+    for _, track in ipairs(tracks) do
+        if track["type"] == "sub" and track["title"] == sub_title then
+            return true, track["id"]
+        end
+    end
+    return false, nil
+end
+
+local function append_sub(sub_file)
+    local sub, id = check_sub(sub_file)
+    if not sub then
+        mp.commandv('sub-add', sub_file)
+    else
+        mp.commandv('sub-reload', id)
+    end
+end
+
+local function parse_sub(filename)
+    local subtitles = {}
+    local file = io.open(filename, "r")
+    if not file then return nil end
+    local index, start_time, end_time, text
+    for line in file:lines() do
+        line = line:gsub("[\r\n]+", "")
+        if line:match("^%d+$") then
+            index = tonumber(line)
+        elseif line:match("^%d%d:%d%d:%d%d,%d%d%d%s%-%->%s%d%d:%d%d:%d%d,%d%d%d$") then
+            start_time, end_time = line:match("^(%d%d:%d%d:%d%d,%d%d%d)%s%-%->%s(%d%d:%d%d:%d%d,%d%d%d)$")
+            start_time = start_time:gsub(",", "."):sub(1, -2)
+            end_time = end_time:gsub(",", "."):sub(1, -2)
+        elseif line:match("^%s*$") then
+            if index and start_time and end_time and text then
+                table.insert(subtitles, {index = index, start_time = start_time, end_time = end_time, text = text})
+            end
+            index, start_time, end_time, text = nil, nil, nil, nil
+        else
+            text = (text and text .. "\n" or "") .. line
+        end
+    end
+    file:close()
+    return subtitles
+end
+
+-- Merge two subtitles
+local function merge_subtitles(sub1, sub2)
+    local merged = {}
+    local used1, used2 = {}, {}
+    for i, s1 in ipairs(sub1) do
+        for j, s2 in ipairs(sub2) do
+            if not used1[i] and not used2[j] and s1.start_time == s2.start_time then
+                table.insert(merged, {
+                    start_time = s1.start_time,
+                    end_time = s1.end_time or s2.end_time,
+                    text = s1.text .. ((s1.text ~= "" and s2.text ~= "") and "\n" or "") .. s2.text
+                })
+                used1[i] = true
+                used2[j] = true
+            end
+        end
+    end
+    for i, s1 in ipairs(sub1) do
+        if not used1[i] then
+            table.insert(merged, { start_time = s1.start_time, end_time = s1.end_time, text = s1.text })
+        end
+    end
+    for j, s2 in ipairs(sub2) do
+        if not used2[j] then
+            table.insert(merged, { start_time = s2.start_time, end_time = s2.end_time, text = s2.text })
+        end
+    end
+    table.sort(merged, function(a, b) return a.start_time < b.start_time end)
+    return merged
+end
+
+-- Generating ASS subtitles file (for bilingual display)
+local function generate_ass(subtitles_file)
+    local ass_name = string.format(".%s.ass", o.translate)
+    local translated_file = subtitles_file:gsub("%.srt$", ".translate.srt")
+    local merge_file = subtitles_file:gsub("%.srt$", ass_name)
+    if file_exists(subtitles_file) and file_exists(translated_file) then
+        local sub1 = parse_sub(translated_file)
+        local sub2 = parse_sub(subtitles_file)
+        if sub1 and sub2 then
+            merged = merge_subtitles(sub1, sub2)
+            if #merged == 0 then return end
+        end
+    end
+    local file = io.open(merge_file, "w")
+    if not file then return end
+    file:write("[Script Info]\nTitle: Bilingual Subtitles\nScriptType: v4.00+\nWrapStyle: 0\nScaledBorderAndShadow: yes\nPlayResX: 1920\nPlayResY: 1080\n\n")
+    file:write("[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n")
+    file:write("Style: Default,".. o.font_name ..",70,&H00FFFFFF,&HF0000000,&H00000000,&H32000000,0,0,0,0,100,100,0,0.00,1,2,1,2,5,5,2,-1\n\n")
+    file:write("[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
+    for _, sub in ipairs(merged) do
+        local translate_text, original_text = sub.text:gsub("\n$", ""):match("^(.-)\n+(.*)$")
+        if translate_text and original_text then
+            translate_text = translate_text:gsub("^%s*(.-)%s*$", "%1")
+            original_text = original_text:gsub("^%s*(.-)%s*$", "%1")
+            if is_text_identical(translate_text, original_text) then
+                file:write(string.format("Dialogue: 0,%s,%s,Default,,0,0,0,,%s\n", sub.start_time, sub.end_time, translate_text))
+            else
+                file:write(string.format("Dialogue: 0,%s,%s,Default,,0,0,0,,%s\\N{\\fn%s}{\\b0}{\\fs50}{\\c&H62A8EB&}{\\shad1}%s\n", sub.start_time, sub.end_time, translate_text, o.font_name, original_text))
+            end
+        end
+    end
+    file:close()
+    append_sub(merge_file)
+end
+
+------------- Translation functions (using GPT API) -------------
+local function call_gpt_api(subtitles)
+    msg.info("AI subtitle translation in progress")
+    local prompt = string.format("You are a professional translation assistant, Translate the following subtitles from the original language to %s.", o.translate)
+    local request_body = {
+        messages = {
+            { role = "system", content = prompt },
+            { role = "user", content = subtitles }
+        },
+        model = o.api_mode,
+        temperature = o.api_temperature
+    }
+    local request_json = utils.format_json(request_body)
+    local command = {
+        "curl", "-s", "-X", "POST", o.api_url,
+        "-H", "Content-Type: application/json",
+        "-H", "Authorization: Bearer " .. o.api_key,
+        "-d", request_json,
+    }
+    local result = mp.command_native({ name = "subprocess", args = command, capture_stdout = true, capture_stderr = true })
+    if result.status ~= 0 then
+        msg.info("API request failed: " .. (result.stderr or "Unknown error"))
+        return nil
+    end
+    local response = utils.parse_json(result.stdout)
+    if response and response.choices and #response.choices > 0 then
+        return response.choices[1].message.content
+    else
+        msg.info("Unable to parse API response")
+        return nil
+    end
+end
+
+local function parse_srt(file_path)
+    local file = io.open(file_path, "r")
+    if not file then
+        msg.error("Unable to open file: " .. file_path)
+        return nil
+    end
+    local subtitles = {}
+    local current_entry = {}
+    for line in file:lines() do
+        line = line:gsub("[\r\n]+", "")
+        if line:match("^%d+$") then
+            if current_entry.text then table.insert(subtitles, current_entry) end
+            current_entry = { id = line, timestamp = nil, text = nil }
+        elseif line:match("^%d%d:%d%d:%d%d,%d%d%d%s*%-%-%>%s*%d%d:%d%d:%d%d,%d%d%d$") then
+            current_entry.timestamp = line
+        elseif line ~= "" then
+            current_entry.text = (current_entry.text and current_entry.text .. "\n" or "") .. line
+        end
+    end
+    if current_entry.text then table.insert(subtitles, current_entry) end
+    file:close()
+    return subtitles
+end
+
+-- Translate subtitles and write to file
+local function translate_and_write(subtitles, subtitles_file, translated_file, start_index)
+    local batch_size = 20
+    local max_calls_per_minute = o.api_rate
+    local delay_between_calls = 60 / max_calls_per_minute
+    local end_index = math.min(start_index + batch_size - 1, #subtitles)
+    local batch = {}
+    for i = start_index, end_index do
+        local subtitle = subtitles[i]
+        table.insert(batch, subtitle.timestamp .. " | " .. subtitle.text)
+    end
+    local batch_text = table.concat(batch, "\n")
+    local translated_text = call_gpt_api(batch_text)
+    if not translated_text then
+        msg.warn("Translation failed, skipping current batch")
+        translated_text = batch_text
+    end
+    local translated_lines = {}
+    for line in translated_text:gmatch("[^\r\n]+") do
+        table.insert(translated_lines, line)
+    end
+    if #translated_lines ~= batch_size then
+        msg.warn("Translated lines do not match original subtitle lines: Original=" .. batch_size .. ", Translated=" .. #translated_lines)
+    end
+    local file = io.open(translated_file, "a")
+    if not file then
+        msg.error("Unable to open file for appending: " .. translated_file)
+        return
+    end
+    local latest_content = {}
+    for i = 1, #translated_lines do
+        local translated_line = translated_lines[i]
+        local timestamp, text = translated_line:match("^(.*) | (.*)$")
+        if not timestamp or not text then
+            local subtitle = subtitles[start_index + i - 1]
+            timestamp = subtitle.timestamp
+            text = subtitle.text
+        end
+        if timestamp and text then
+            timestamp = timestamp:gsub("%s*$", "")
+            text = text:gsub("%s*$", "")
+            latest_content[timestamp] = text
+        end
+    end
+    local sorted_timestamps = {}
+    for timestamp in pairs(latest_content) do table.insert(sorted_timestamps, timestamp) end
+    table.sort(sorted_timestamps, function(a, b)
+        local start_time_a = a:match("^(.*) %-%-%>")
+        local start_time_b = b:match("^(.*) %-%-%>")
+        return start_time_a < start_time_b
+    end)
+    local current_index = start_index
+    for _, timestamp in ipairs(sorted_timestamps) do
+        local text = latest_content[timestamp]
+        file:write(current_index .. "\n")
+        file:write(timestamp .. "\n")
+        file:write(text .. "\n\n")
+        current_index = current_index + 1
+    end
+    file:close()
+    append_sub(translated_file)
+    msg.info("Translated and written batch: " .. start_index .. " to " .. end_index)
+    if end_index < #subtitles then
+        mp.add_timeout(delay_between_calls, function()
+            translate_and_write(subtitles, subtitles_file, translated_file, end_index + 1)
+        end)
+    else
+        msg.info("Subtitle translation completed!")
+        append_sub(translated_file)
+        generate_ass(subtitles_file)
+    end
+end
+
+local function translate_srt_file(subtitles_file)
+    if o.api_key == "" then return end
+    if not subtitles_file then subtitles_file = get_current_sub() end
+    if not subtitles_file then return end
+    local subtitles = parse_srt(subtitles_file)
+    if not subtitles then
+        msg.error("Failed to parse .srt file")
+        return
+    end
+    local translated_file = subtitles_file:gsub("%.srt$", ".translate.srt")
+    local file = io.open(translated_file, "w")
+    if not file then
+        msg.error("Unable to create file: " .. translated_file)
+        return
+    end
+    file:close()
+    translate_and_write(subtitles, subtitles_file, translated_file, 1)
+end
+--------------------------------------------------
+
+-- Build the faster-whisper command
+local function fastwhisper_cmd(file_path, sub_path)
+    local args = {
+        fast_whisper_path,
+        file_path,
+        "--beep_off",
+        "--model", o.model,
+        "--device", o.device,
+        "--max_line_width", o.max_line_width,
+        "--threads", o.threads,
+        "--output_dir", sub_path,
+    }
+    if o.language ~= "" then
+        table.insert(args, "--language")
+        table.insert(args, o.language)
+    end
+    return args
+end
+
+--------------------------------------------------
+-- Modified fastwhisper() for MP3 extraction
+local function fastwhisper()
+    if whisper_running then return end
+    local orig_path = mp.get_property("path")
+    local fname = mp.get_property("filename/no-ext")
+if not fname or fname == "" then
+    fname = "video"
+else
+    fname = sanitize_filename(fname)
+end
+
+    if not orig_path then return end
+
+    -- Extract audio as MP3 from the video (local or streaming)
+    local audio_file = utils.join_path(output_path, fname .. ".mp3")
+    local ffmpeg_args = {
+    "ffmpeg",
+    "-y",
+    "-i", orig_path,
+    "-vn",
+    "-acodec", "libmp3lame",
+    audio_file
+}
+msg.info("Extracting audio as MP3 using FFmpeg...")
+local res = mp.command_native({ name = "subprocess", args = ffmpeg_args, capture_stdout = true, capture_stderr = true })
+if res.status ~= 0 then
+    local error_msg = "FFmpeg audio extraction failed: " .. (res.stderr or "unknown error")
+    mp.osd_message(error_msg, 10)  -- Display error on screen for 10 seconds
+    msg.error(error_msg)
+    return
+end
+
+    msg.info("Extracting audio as MP3 using FFmpeg...")
+    local res = mp.command_native({ name = "subprocess", capture_stdout = true, capture_stderr = true, args = ffmpeg_args })
+    if res.status ~= 0 then
+        msg.error("FFmpeg audio extraction failed: " .. (res.stderr or "unknown error"))
+        return
+    end
+
+    local path = audio_file  -- Use the extracted MP3 file for transcription
+
+    local dir = output_path
+    local subtitles_file = utils.join_path(dir, fname .. ".srt")
+    if file_exists(subtitles_file) then return end
+
+    local screenx, screeny, aspect = mp.get_osd_size()
+    mp.set_osd_ass(screenx, screeny, "{\\an9}● ")
+    mp.osd_message("AI subtitle generation in progress", 9)
+    msg.info("AI subtitle generation in progress")
+
+    subtitle_count = 1
+    append_subtitle_count = 1
+    subtitles_written = false
+    whisper_running = true
+
+    local args = fastwhisper_cmd(path, dir)
+    mp.command_native_async({ name = "subprocess", capture_stderr = true, args = args }, function(success, res)
+        whisper_running = false
+        mp.set_osd_ass(screenx, screeny, "")
+        if res.status ~= 0 then
+            if file_exists(subtitles_file) then
+                local file = io.open(subtitles_file, "r")
+                if file then
+                    local content = file:read("*all")
+                    file:close()
+                    if content == "" then
+                        os.remove(subtitles_file)
+                    else
+                        mp.osd_message("AI subtitles successfully generated", 5)
+                        msg.info("AI subtitles successfully generated")
+                        append_sub(subtitles_file)
+                        translate_srt_file(subtitles_file)
+                    end
+                end
+            end
+        else
+            mp.osd_message("AI subtitle generation failed, check console for more info.")
+            msg.info("AI subtitle generation failed")
+        end
+
+        -- Do NOT delete the MP3 file (for testing purposes)
+         if file_exists(path) then
+             os.remove(path)
+             msg.info("Temporary audio file deleted: " .. path)
+         end
+    end)
+end
+
+--------------------------------------------------
+-- Modified fastwhisper_segment() for MP3 extraction (if using segmentation)
+local function fastwhisper_segment()
+    if whisper_running then return end
+    local orig_path = mp.get_property("path")
+    local fname = mp.get_property("filename/no-ext")
+    if not fname or fname == "" then fname = "video" end
+    if not orig_path then return end
+
+    -- Extract audio as MP3 for segmented processing
+    local audio_file = utils.join_path(output_path, fname .. ".mp3")
+    local ffmpeg_args = {
+    "ffmpeg",
+    "-y",
+    "-i", orig_path,
+    "-vn",
+    "-acodec", "libmp3lame",
+    audio_file
+}
+msg.info("Extracting audio as MP3 using FFmpeg for segmented processing...")
+local res = mp.command_native({ name = "subprocess", args = ffmpeg_args, capture_stdout = true, capture_stderr = true })
+if res.status ~= 0 then
+    local error_msg = "FFmpeg audio extraction failed: " .. (res.stderr or "unknown error")
+    mp.osd_message(error_msg, 10)  -- Display error on screen for 10 seconds
+    msg.error(error_msg)
+    return
+end
+
+    msg.info("Extracting audio as MP3 using FFmpeg for segmented processing...")
+    local res = mp.command_native({ name = "subprocess", capture_stdout = true, capture_stderr = true, args = ffmpeg_args })
+    if res.status ~= 0 then
+        msg.error("FFmpeg audio extraction failed: " .. (res.stderr or "unknown error"))
+        return
+    end
+
+    local path = audio_file  -- Use the extracted MP3 file for segmentation
+
+    local dir = output_path
+    local subtitles_file = utils.join_path(dir, fname .. ".srt")
+    if file_exists(subtitles_file) then
+        msg.info("Subtitles file already exists: " .. subtitles_file)
+        return
+    end
+
+    mp.osd_message("AI subtitle generation in progress", 9)
+    msg.info("AI subtitle generation in progress")
+
+    whisper_running = true
+    process_video_incrementally(path, subtitles_file, o.segment_duration)
+    whisper_running = false
+
+    if file_exists(subtitles_file) then
+        mp.osd_message("AI subtitles successfully generated", 5)
+        msg.info("Subtitles generation completed: " .. subtitles_file)
+        translate_srt_file(subtitles_file)
+    end
+
+    -- Do NOT delete the MP3 file (for testing purposes)
+     if file_exists(path) then
+         os.remove(path)
+         msg.info("Temporary audio file deleted: " .. path)
+     end
+end
+
+--------------------------------------------------
+-- High-level function to choose segmented or non-segmented mode
+local function whisper()
+    if o.use_segment then
+        fastwhisper_segment()
+    else
+        fastwhisper()
+    end
+end
+
+--------------------------------------------------
+mp.add_hook("on_unload", 50, function()
+    -- Do not remove the MP3 file here (for testing)
+    local temp_path = os.getenv("TEMP") or "/tmp/"
+    local segment_audio_file = utils.join_path(temp_path, "temp.wav")
+    local temp_srt_file = utils.join_path(temp_path, "temp.srt")
+    local path = mp.get_property("path")
+    local dir = utils.split_path(path)
+    local filename = mp.get_property("filename/no-ext")
+    local translated_file = utils.join_path(dir, filename .. ".translate.srt")
+    if file_exists(segment_audio_file) then os.remove(segment_audio_file) end
+    if file_exists(temp_srt_file) then os.remove(temp_srt_file) end
+    check_and_remove_empty_file(subtitles_file)
+    check_and_remove_empty_file(translated_file)
+end)
+
+mp.register_script_message("sub-translate", translate_srt_file)
+mp.register_script_message("sub-fastwhisper", whisper)
